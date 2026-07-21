@@ -1,4 +1,4 @@
-# jar2dll
+# jar2dll/jartodll
 
 [中文文档](README_zh_CN.md) · [License](LICENSE) · [Contributing](CONTRIBUTING.md)
 
