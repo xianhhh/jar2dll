@@ -32,7 +32,6 @@ param(
     [ValidateSet('x64', 'Win32')]
     [string]$Platform = 'x64',
 
-    [Alias('candump')]
     [bool]$CanDump = $true,
 
     [switch]$Clean,

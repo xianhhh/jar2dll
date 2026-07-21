@@ -1,6 +1,7 @@
 # Build and package output
 /build/
 /dist/
+/release/
 /Temp/
 /artifacts/
 /memory_negative_tests.obj
