@@ -1,0 +1,4 @@
+rootProject.name = 'jar2dll-gradle'
+
+include 'jar2dll-annotations'
+include 'jar2dll-gradle-plugin'

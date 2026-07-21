@@ -1,0 +1,73 @@
+# Build and package output
+/build/
+/dist/
+/Temp/
+/artifacts/
+/memory_negative_tests.obj
+*.log
+*.tmp
+*.bak
+*.cache
+*.pid
+/**/*.dll
+/**/*.exe
+/**/*.pdb
+/**/*.obj
+/**/*.lib
+/**/*.exp
+/**/*.ilk
+/**/*.idb
+/**/*.ipdb
+/**/*.iobj
+/**/*.tlog
+
+# Native build trees and IDE-generated native output
+/cpp/jni-tests/build/
+/cpp/maindll/maindll/maindll/x64/
+/cpp/maindll/maindll/maindll/Win32/
+**/Debug/
+**/Release/
+**/RelWithDebInfo/
+**/MinSizeRel/
+**/ipch/
+
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+
+# Java / Gradle
+**/.gradle/
+**/build/
+**/out/
+**/Temp/
+**/.classpath
+**/.project
+**/.settings/
+*.class
+*.jar
+*.war
+*.ear
+!**/gradle/wrapper/gradle-wrapper.jar
+
+# CMake / Visual Studio
+**/CMakeFiles/
+**/CMakeCache.txt
+**/cmake_install.cmake
+**/Testing/
+*.vcxproj.user
+*.VC.db
+*.VC.opendb
+*.sdf
+*.opensdf
+
+# Editors and operating systems
+.vs/
+.idea/
+.vscode/
+*.swp
+*.sln.docstates
+.DS_Store
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="maindll/maindll.vcxproj" Id="5874262d-d9c6-4014-840c-f2cbe513a692" />
+</Solution>

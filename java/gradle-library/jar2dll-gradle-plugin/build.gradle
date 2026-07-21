@@ -1,0 +1,44 @@
+plugins {
+    id 'java-gradle-plugin'
+    id 'maven-publish'
+}
+
+dependencies {
+    implementation project(':jar2dll-annotations')
+}
+
+gradlePlugin {
+    plugins {
+        jar2dll {
+            id = 'xh.xianhhh.jar2dll'
+            implementationClass = 'xh.xianhhh.jar2dll.gradle.Jar2DllPlugin'
+            displayName = 'Jar2Dll Gradle Plugin'
+            description = 'Builds a Windows DLL that embeds a Java application.'
+        }
+    }
+}
+
+// The builder is self-contained; keeping it in the plugin makes a published
+// plugin usable without a separate system installation.
+tasks.named('processResources') {
+    from(rootProject.layout.projectDirectory.dir('../../dist/builder')) {
+        include 'j2d.exe'
+        into 'jar2dll'
+    }
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(17)
+    }
+    withSourcesJar()
+}
+
+publishing {
+    publications {
+        maven(MavenPublication) {
+            from components.java
+            artifactId = 'jar2dll-gradle-plugin'
+        }
+    }
+}

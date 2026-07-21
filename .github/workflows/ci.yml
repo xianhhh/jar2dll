@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  managed-and-java:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 10.0.x
+
+      - name: Set up JDK
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Build command-line builder
+        run: dotnet build csharp\builder\Jar2Dll.Builder.csproj --configuration Release
+
+      - name: Build GUI
+        run: dotnet build csharp\gui\Jar2Dll.Gui.csproj --configuration Release
+
+      - name: Test ASM rewriter
+        working-directory: java\readBytesJar
+        run: .\gradlew.bat test memoryRewriterJar --no-daemon

@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AssemblyName>jar2dll-builder</AssemblyName>
+    <RootNamespace>Jar2Dll.Builder</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll.slnx" LogicalName="Native.maindll.slnx" />
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll\dllmain.cpp" LogicalName="Native.maindll.dllmain.cpp" />
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll\jar2dll.hpp" LogicalName="Native.maindll.jar2dll.hpp" />
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll\jni_exports.hpp" LogicalName="Native.maindll.jni_exports.hpp" />
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll\memory_pe.hpp" LogicalName="Native.maindll.memory_pe.hpp" />
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll\memory_bundle.hpp" LogicalName="Native.maindll.memory_bundle.hpp" />
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll\jniheader.h" LogicalName="Native.maindll.jniheader.h" />
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll\framework.h" LogicalName="Native.maindll.framework.h" />
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll\pch.h" LogicalName="Native.maindll.pch.h" />
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll\pch.cpp" LogicalName="Native.maindll.pch.cpp" />
+    <EmbeddedResource Include="..\..\cpp\maindll\maindll\maindll.vcxproj" LogicalName="Native.maindll.maindll.vcxproj" />
+  </ItemGroup>
+</Project>
