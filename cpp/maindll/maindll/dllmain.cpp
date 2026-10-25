@@ -10,11 +10,15 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <cwchar>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <mutex>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -29,10 +33,33 @@ namespace fs = std::filesystem;
 JavaVM* g_jvm = nullptr;
 jvmtiEnv* g_jvmti = nullptr;
 HMODULE g_module = nullptr;
-// Memory-mode modules must outlive every Java class using their registered
-// function pointers.  They deliberately remain mapped until process exit.
-std::unique_ptr<j2d::memory::ModuleRegistry> g_memoryModules;
-std::unordered_set<std::string> g_memoryNativeClasses;
+
+// Registered JNI function pointers remain valid only while both this DLL and
+// every mapped native image stay resident. The loader thread pins this DLL for
+// the process lifetime. Published memory state is immutable and read through a
+// shared snapshot so ClassPrepare never observes a partially initialized registry.
+std::mutex g_memoryStateMutex;
+std::mutex g_nativeRegistrationMutex;
+std::shared_ptr<j2d::memory::ModuleRegistry> g_memoryModules;
+std::shared_ptr<const std::unordered_set<std::string>> g_memoryNativeClasses;
+
+struct MemoryStateSnapshot {
+    std::shared_ptr<j2d::memory::ModuleRegistry> modules;
+    std::shared_ptr<const std::unordered_set<std::string>> nativeClasses;
+};
+
+MemoryStateSnapshot memoryStateSnapshot() {
+    std::lock_guard lock(g_memoryStateMutex);
+    return {g_memoryModules, g_memoryNativeClasses};
+}
+
+void publishMemoryState(
+    std::shared_ptr<j2d::memory::ModuleRegistry> modules,
+    std::shared_ptr<const std::unordered_set<std::string>> nativeClasses) {
+    std::lock_guard lock(g_memoryStateMutex);
+    g_memoryModules = std::move(modules);
+    g_memoryNativeClasses = std::move(nativeClasses);
+}
 
 enum EmbeddedResourceId : int {
     RESOURCE_J2DF = 101,
@@ -173,8 +200,10 @@ private:
 class AttachedThreadGuard final {
 public:
     explicit AttachedThreadGuard(JavaVM* vm) noexcept : vm_(vm) {
-        if (vm_ != nullptr
-            && vm_->AttachCurrentThreadAsDaemon(reinterpret_cast<void**>(&env_), nullptr) == JNI_OK) {
+        if (vm_ != nullptr) {
+            status_ = vm_->AttachCurrentThreadAsDaemon(reinterpret_cast<void**>(&env_), nullptr);
+        }
+        if (status_ == JNI_OK) {
             attached_ = true;
         }
     }
@@ -189,11 +218,13 @@ public:
     AttachedThreadGuard& operator=(const AttachedThreadGuard&) = delete;
 
     JNIEnv* env() const noexcept { return env_; }
+    jint status() const noexcept { return status_; }
     explicit operator bool() const noexcept { return attached_ && env_ != nullptr; }
 
 private:
     JavaVM* vm_ = nullptr;
     JNIEnv* env_ = nullptr;
+    jint status_ = JNI_ERR;
     bool attached_ = false;
 };
 
@@ -204,17 +235,41 @@ void logError(const std::string& message) {
 }
 
 // Java 异常挂起时不能继续执行普通 JNI 调用。报告并清除异常后，清理路径才能继续。
-bool reportAndClearException(JNIEnv* env, const char* context, bool describe = true) {
-    if (env == nullptr || !env->ExceptionCheck()) {
-        return false;
-    }
-    if (context != nullptr) {
-        logError(std::string(context) + " raised a Java exception");
-    }
-    if (describe) {
-        env->ExceptionDescribe();
-    }
+std::string takePendingJavaException(JNIEnv* env, bool describe = false) {
+    if (env == nullptr || !env->ExceptionCheck()) return {};
+
+    jthrowable exception = env->ExceptionOccurred();
+    if (describe) env->ExceptionDescribe();
     env->ExceptionClear();
+    if (exception == nullptr) return "unknown Java exception";
+
+    std::string detail = "Java exception";
+    jclass exceptionClass = env->GetObjectClass(exception);
+    if (exceptionClass != nullptr && !env->ExceptionCheck()) {
+        const jmethodID toString = env->GetMethodID(exceptionClass, "toString", "()Ljava/lang/String;");
+        if (toString != nullptr && !env->ExceptionCheck()) {
+            jstring text = static_cast<jstring>(env->CallObjectMethod(exception, toString));
+            if (text != nullptr && !env->ExceptionCheck()) {
+                const char* chars = env->GetStringUTFChars(text, nullptr);
+                if (chars != nullptr) {
+                    detail.assign(chars);
+                    env->ReleaseStringUTFChars(text, chars);
+                }
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+            if (text != nullptr) env->DeleteLocalRef(text);
+        }
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (exceptionClass != nullptr) env->DeleteLocalRef(exceptionClass);
+    env->DeleteLocalRef(exception);
+    return detail;
+}
+
+bool reportAndClearException(JNIEnv* env, const char* context, bool describe = true) {
+    if (env == nullptr || !env->ExceptionCheck()) return false;
+    const std::string detail = takePendingJavaException(env, describe);
+    logError(std::string(context == nullptr ? "JNI operation" : context) + " failed: " + detail);
     return true;
 }
 
@@ -236,6 +291,83 @@ fs::path getDllDirectory() {
     std::error_code error;
     const fs::path current = fs::current_path(error);
     return error ? fs::path(L".") : current;
+}
+
+std::string wideToUtf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    const int required = WideCharToMultiByte(
+        CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+        nullptr, 0, nullptr, nullptr);
+    if (required <= 0) return {};
+    std::string result(static_cast<std::size_t>(required), '\0');
+    if (WideCharToMultiByte(
+            CP_UTF8, WC_ERR_INVALID_CHARS, value.data(), static_cast<int>(value.size()),
+            result.data(), required, nullptr, nullptr) != required) {
+        return {};
+    }
+    return result;
+}
+
+std::wstring safePathComponent(std::wstring value) {
+    for (wchar_t& character : value) {
+        if (character < 32 || wcschr(L"<>:\"/\\|?*", character) != nullptr) character = L'_';
+    }
+    return value.empty() ? L"module" : value;
+}
+
+fs::path getRuntimeResourceDirectory() {
+    std::vector<wchar_t> tempBuffer(512);
+    DWORD length = GetTempPathW(static_cast<DWORD>(tempBuffer.size()), tempBuffer.data());
+    if (length >= tempBuffer.size()) {
+        tempBuffer.resize(static_cast<std::size_t>(length) + 1);
+        length = GetTempPathW(static_cast<DWORD>(tempBuffer.size()), tempBuffer.data());
+    }
+    fs::path tempRoot;
+    if (length > 0 && length < tempBuffer.size()) {
+        tempRoot = fs::path(tempBuffer.data(), tempBuffer.data() + length);
+    }
+    else {
+        std::error_code error;
+        tempRoot = fs::temp_directory_path(error);
+        if (error) tempRoot = getDllDirectory();
+    }
+
+    std::wostringstream instance;
+    instance << GetCurrentProcessId() << L'-' << std::hex
+        << reinterpret_cast<std::uintptr_t>(g_module);
+    const std::wstring moduleName = safePathComponent(getDllDirectory().filename().wstring());
+    return tempRoot / L"jar2dll" / moduleName / instance.str() / L"resources";
+}
+
+bool setJavaSystemProperty(JNIEnv* env, const char* name, const std::string& value) {
+    LocalRef<jclass> systemClass(env, env->FindClass("java/lang/System"));
+    if (!systemClass || reportAndClearException(env, "Resolving java.lang.System for resource properties")) return false;
+    const jmethodID setProperty = env->GetStaticMethodID(
+        systemClass.get(), "setProperty", "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+    if (setProperty == nullptr || reportAndClearException(env, "Resolving System.setProperty")) return false;
+    LocalRef<jstring> key(env, env->NewStringUTF(name));
+    LocalRef<jstring> propertyValue(env, env->NewStringUTF(value.c_str()));
+    if (!key || !propertyValue || reportAndClearException(env, "Creating resource property strings")) return false;
+    LocalRef<jstring> previous(
+        env,
+        static_cast<jstring>(env->CallStaticObjectMethod(
+            systemClass.get(), setProperty, key.get(), propertyValue.get())));
+    return !reportAndClearException(env, "Setting Java resource property");
+}
+
+bool publishRuntimeResourceDirectory(JNIEnv* env, const fs::path& resourceDirectory) {
+    const std::string utf8Path = wideToUtf8(resourceDirectory.wstring());
+    if (utf8Path.empty()) {
+        logError("Could not convert runtime resource directory to UTF-8");
+        return false;
+    }
+    SetEnvironmentVariableW(L"JAR2DLL_RESOURCE_DIR", resourceDirectory.c_str());
+    const bool customProperty = setJavaSystemProperty(env, "jar2dll.resource.dir", utf8Path);
+    const bool userDirectory = setJavaSystemProperty(env, "user.dir", utf8Path);
+    if (customProperty) {
+        std::cerr << "[jar2dll] Runtime resources: " << utf8Path << std::endl;
+    }
+    return customProperty && userDirectory;
 }
 
 // 保留原配置清洗行为：移除所有不可打印字符和空白字符。
@@ -398,8 +530,14 @@ jobject findTargetClassLoader(
 
     const jsize length = env->GetArrayLength(threads.get());
     for (jsize index = 0; index < length; ++index) {
+        if (env->ExceptionCheck()) {
+            reportAndClearException(env, "Unexpected pending exception before PushLocalFrame");
+            return nullptr;
+        }
         if (env->PushLocalFrame(16) != JNI_OK) {
-            reportAndClearException(env, "PushLocalFrame");
+            if (!reportAndClearException(env, "PushLocalFrame while scanning ClassLoaders")) {
+                logError("PushLocalFrame failed while scanning ClassLoaders without a pending Java exception");
+            }
             return nullptr;
         }
 
@@ -411,12 +549,12 @@ jobject findTargetClassLoader(
         bool matched = false;
         const char* loaderNameChars = nullptr;
         jstring loaderName = nullptr;
-        if (!reportAndClearException(env, nullptr, false) && loader != nullptr) {
+        if (!reportAndClearException(env, "Reading candidate thread context ClassLoader", false) && loader != nullptr) {
             jobject loaderClass = env->CallObjectMethod(loader, getClass);
             loaderName = loaderClass == nullptr
                 ? nullptr
                 : static_cast<jstring>(env->CallObjectMethod(loaderClass, getName));
-            if (!reportAndClearException(env, nullptr, false) && loaderName != nullptr) {
+            if (!reportAndClearException(env, "Reading candidate ClassLoader type", false) && loaderName != nullptr) {
                 loaderNameChars = env->GetStringUTFChars(loaderName, nullptr);
                 if (loaderNameChars == nullptr) {
                     reportAndClearException(env, "Reading ClassLoader class name");
@@ -457,17 +595,25 @@ bool isSafeRelativeResourcePath(const fs::path& relative) {
 
 // 清理发生在普通工作线程，而不是 DLL_PROCESS_DETACH 的 loader lock 中。
 // 正常情况下，上一次运行已无进程使用这些文件；当前运行生成的资源保持原使用周期。
-void cleanupPreviousResources(const fs::path& resourceDirectory) {
+bool cleanupPreviousResources(const fs::path& resourceDirectory) {
     std::error_code error;
     if (fs::exists(resourceDirectory, error) && !error) {
         fs::remove_all(resourceDirectory, error);
         if (error) {
-            logError("Could not completely clean the previous resources directory: " + error.message());
+            logError("Could not clean this process's resource directory: " + error.message());
+            return false;
         }
     }
+    fs::create_directories(resourceDirectory, error);
+    if (error) {
+        logError("Could not create this process's resource directory: " + error.message());
+        return false;
+    }
+    return true;
 }
 
-void writeResources(const std::vector<j2d::JarEntry*>& entries, const fs::path& resourceDirectory) {
+bool writeResources(const std::vector<j2d::JarEntry*>& entries, const fs::path& resourceDirectory) {
+    bool success = true;
     for (j2d::JarEntry* entry : entries) {
         if (entry->getType() != j2d::TYPE_RESOURCE) {
             continue;
@@ -491,6 +637,7 @@ void writeResources(const std::vector<j2d::JarEntry*>& entries, const fs::path& 
         const fs::path relative = fs::path(entryName).lexically_normal();
         if (!isSafeRelativeResourcePath(relative)) {
             logError("Rejected unsafe resource path: " + entryName);
+            success = false;
             continue;
         }
 
@@ -502,12 +649,14 @@ void writeResources(const std::vector<j2d::JarEntry*>& entries, const fs::path& 
         }
         if (error) {
             logError("Could not create resource directory for " + entryName + ": " + error.message());
+            success = false;
             continue;
         }
 
         std::ofstream output(filePath, std::ios::binary | std::ios::trunc);
         if (!output) {
             logError("Could not open resource file: " + entryName);
+            success = false;
             continue;
         }
         if (entry->getSize() > 0) {
@@ -516,8 +665,10 @@ void writeResources(const std::vector<j2d::JarEntry*>& entries, const fs::path& 
         output.close();
         if (!output) {
             logError("Could not fully write resource file: " + entryName);
+            success = false;
         }
     }
+    return success;
 }
 
 bool isClassEntry(const j2d::JarEntry* entry) {
@@ -531,16 +682,32 @@ std::string className(const j2d::JarEntry* entry) {
 }
 
 jclass loadClassFromTargetLoader(JNIEnv* env, jobject loader, const std::string& internalName) {
+    if (env == nullptr) {
+        logError("loadClassFromTargetLoader received a null JNIEnv for " + internalName);
+        return nullptr;
+    }
+    if (loader == nullptr) {
+        logError("loadClassFromTargetLoader received a null ClassLoader for " + internalName);
+        return nullptr;
+    }
     LocalRef<jclass> loaderClass(env, env->GetObjectClass(loader));
-    if (!loaderClass) return nullptr;
+    if (!loaderClass || reportAndClearException(env, ("Getting target ClassLoader class for " + internalName).c_str())) {
+        return nullptr;
+    }
     const jmethodID loadClass = env->GetMethodID(
         loaderClass.get(), "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
-    if (loadClass == nullptr) return nullptr;
+    if (loadClass == nullptr || reportAndClearException(env, ("Resolving ClassLoader.loadClass for " + internalName).c_str())) {
+        return nullptr;
+    }
     std::string binaryName = internalName;
     std::replace(binaryName.begin(), binaryName.end(), '/', '.');
     LocalRef<jstring> name(env, env->NewStringUTF(binaryName.c_str()));
-    if (!name) return nullptr;
-    return static_cast<jclass>(env->CallObjectMethod(loader, loadClass, name.get()));
+    if (!name || reportAndClearException(env, ("Creating class name for " + internalName).c_str())) return nullptr;
+    jclass result = static_cast<jclass>(env->CallObjectMethod(loader, loadClass, name.get()));
+    if (reportAndClearException(env, ("Loading class " + binaryName + " through target ClassLoader").c_str(), false)) {
+        return nullptr;
+    }
+    return result;
 }
 
 const j2d::JarEntry* findMemoryBundleEntry(const std::vector<j2d::JarEntry*>& entries) {
@@ -551,16 +718,31 @@ const j2d::JarEntry* findMemoryBundleEntry(const std::vector<j2d::JarEntry*>& en
     return nullptr;
 }
 
-FARPROC findMemoryExport(const char* name) {
-    if (!g_memoryModules) return nullptr;
+FARPROC findMemoryExport(
+    const std::shared_ptr<j2d::memory::ModuleRegistry>& modules,
+    const char* name) {
+    if (!modules || name == nullptr) return nullptr;
     std::string ignored;
-    for (const auto& module : g_memoryModules->modules()) {
-        if (FARPROC result = j2d::memory::findMappedExport(module.image, name, ignored)) return result;
+    FARPROC result = nullptr;
+    std::string provider;
+    for (const auto& module : modules->modules()) {
+        FARPROC candidate = j2d::memory::findMappedExport(module.image, name, ignored);
+        if (candidate == nullptr) continue;
+        if (result != nullptr && candidate != result) {
+            logError("Ambiguous mapped export " + std::string(name) + " in modules "
+                + provider + " and " + module.name);
+            return nullptr;
+        }
+        result = candidate;
+        provider = module.name;
     }
-    return nullptr;
+    return result;
 }
 
-bool mapMemoryModules(const std::vector<j2d::JarEntry*>& entries) {
+bool mapMemoryModules(
+    const std::vector<j2d::JarEntry*>& entries,
+    std::shared_ptr<j2d::memory::ModuleRegistry>& mappedModules) {
+    mappedModules.reset();
     const j2d::JarEntry* bundle = findMemoryBundleEntry(entries);
     if (bundle == nullptr) return true; // Stable mode has no N2DM entry.
 
@@ -569,7 +751,7 @@ bool mapMemoryModules(const std::vector<j2d::JarEntry*>& entries) {
     if (!j2d::memory::parseNativeBundle(reinterpret_cast<const unsigned char*>(bundle->getData()), bundle->getSize(), modules, error)) {
         logError("Memory native bundle is invalid: " + error); return false;
     }
-    auto registry = std::make_unique<j2d::memory::ModuleRegistry>();
+    auto registry = std::make_shared<j2d::memory::ModuleRegistry>();
     for (const auto& module : modules) {
         std::cerr << "[memory] Mapping " << module.name << " (" << module.size << " bytes)" << std::endl;
         j2d::memory::MappedImage image;
@@ -596,16 +778,26 @@ bool mapMemoryModules(const std::vector<j2d::JarEntry*>& entries) {
     // Calling arbitrary third-party DllMain manually is unsafe: normal CRT DLLs
     // require Windows loader state. JNI exports that need it remain rejected by the
     // later compatibility gate rather than being executed in an invalid state.
-    g_memoryModules = std::move(registry);
+    mappedModules = std::move(registry);
     std::cerr << "[memory] Mapped " << modules.size() << " embedded native module(s)" << std::endl;
     return true;
 }
 
-bool registerMemoryNativesForClass(JNIEnv* env, jclass klass, const std::string& internalName) {
-    if (g_jvmti == nullptr || !g_memoryModules) return true;
+bool registerMemoryNativesForClass(
+    JNIEnv* env,
+    jclass klass,
+    const std::string& internalName,
+    const std::shared_ptr<j2d::memory::ModuleRegistry>& modules) {
+    if (env == nullptr || klass == nullptr) {
+        logError("Cannot register memory natives for " + internalName + ": invalid JNI class/environment");
+        return false;
+    }
+    std::lock_guard registrationLock(g_nativeRegistrationMutex);
+    jvmtiEnv* const jvmti = g_jvmti;
+    if (jvmti == nullptr || !modules) return true;
     jint count = 0;
     jmethodID* methods = nullptr;
-    const jvmtiError methodsResult = g_jvmti->GetClassMethods(klass, &count, &methods);
+    const jvmtiError methodsResult = jvmti->GetClassMethods(klass, &count, &methods);
     if (methodsResult != JVMTI_ERROR_NONE) {
         // Classes without native declarations need no registration. Some JVMs
         // report INVALID_CLASS for a just-defined, not-yet-prepared class; leave
@@ -619,30 +811,44 @@ bool registerMemoryNativesForClass(JNIEnv* env, jclass klass, const std::string&
     std::unordered_map<std::string, int> nameCounts;
     for (jint index = 0; index < count; ++index) {
         jint modifiers = 0;
-        const jvmtiError modifiersResult = g_jvmti->GetMethodModifiers(methods[index], &modifiers);
+        const jvmtiError modifiersResult = jvmti->GetMethodModifiers(methods[index], &modifiers);
         if (modifiersResult != JVMTI_ERROR_NONE) {
             logError("JVMTI GetMethodModifiers failed for " + internalName + ": " + std::to_string(modifiersResult));
             continue;
         }
         if ((modifiers & 0x0100) == 0) continue;
         char* name = nullptr; char* descriptor = nullptr;
-        const jvmtiError nameResult = g_jvmti->GetMethodName(methods[index], &name, &descriptor, nullptr);
+        const jvmtiError nameResult = jvmti->GetMethodName(methods[index], &name, &descriptor, nullptr);
         if (nameResult != JVMTI_ERROR_NONE || name == nullptr || descriptor == nullptr) {
             logError("JVMTI GetMethodName failed for " + internalName + ": " + std::to_string(nameResult));
-            if (name) g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
-            if (descriptor) g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(descriptor));
+            if (name) jvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
+            if (descriptor) jvmti->Deallocate(reinterpret_cast<unsigned char*>(descriptor));
             continue;
         }
         candidates.push_back({name, descriptor}); ++nameCounts[candidates.back().name];
-        g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
-        g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(descriptor));
+        jvmti->Deallocate(reinterpret_cast<unsigned char*>(name));
+        jvmti->Deallocate(reinterpret_cast<unsigned char*>(descriptor));
     }
-    if (methods) g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(methods));
+    if (methods) jvmti->Deallocate(reinterpret_cast<unsigned char*>(methods));
     for (auto& candidate : candidates) {
         const std::string shortName = j2d::jni::shortExportName(internalName, candidate.name);
         const std::string longName = j2d::jni::longExportName(internalName, candidate.name, candidate.descriptor);
-        candidate.address = reinterpret_cast<void*>(findMemoryExport(shortName.c_str()));
-        if (candidate.address == nullptr && !longName.empty()) candidate.address = reinterpret_cast<void*>(findMemoryExport(longName.c_str()));
+        const bool overloaded = nameCounts[candidate.name] > 1;
+        std::string selectedExport;
+        if (overloaded) {
+            if (!longName.empty()) {
+                candidate.address = reinterpret_cast<void*>(findMemoryExport(modules, longName.c_str()));
+                if (candidate.address != nullptr) selectedExport = longName;
+            }
+        }
+        else {
+            candidate.address = reinterpret_cast<void*>(findMemoryExport(modules, shortName.c_str()));
+            if (candidate.address != nullptr) selectedExport = shortName;
+            if (candidate.address == nullptr && !longName.empty()) {
+                candidate.address = reinterpret_cast<void*>(findMemoryExport(modules, longName.c_str()));
+                if (candidate.address != nullptr) selectedExport = longName;
+            }
+        }
         if (candidate.address == nullptr) {
             // A JAR can contain native methods provided by an optional or
             // independently loaded library. Leave those unregistered instead of
@@ -652,7 +858,7 @@ bool registerMemoryNativesForClass(JNIEnv* env, jclass klass, const std::string&
             continue;
         }
         std::cerr << "[memory] JNI " << internalName << "." << candidate.name
-            << candidate.descriptor << " <- " << (longName.empty() ? shortName : longName) << std::endl;
+            << candidate.descriptor << " <- " << selectedExport << std::endl;
     }
     if (candidates.empty()) return true;
     std::vector<JNINativeMethod> nativeMethods;
@@ -669,59 +875,63 @@ bool registerMemoryNativesForClass(JNIEnv* env, jclass klass, const std::string&
 }
 
 bool registerMemoryNatives(JNIEnv* env, jobject loader, const std::vector<j2d::JarEntry*>& entries) {
-    if (!g_memoryModules) return true;
+    const MemoryStateSnapshot state = memoryStateSnapshot();
+    if (!state.modules) return true;
     for (j2d::JarEntry* entry : entries) {
         if (!isClassEntry(entry)) continue;
         LocalRef<jclass> klass(env, loadClassFromTargetLoader(env, loader, className(entry)));
-        if (!klass) { reportAndClearException(env, nullptr, false); continue; }
-        if (!registerMemoryNativesForClass(env, klass.get(), className(entry))) return false;
+        if (!klass) continue;
+        if (!registerMemoryNativesForClass(env, klass.get(), className(entry), state.modules)) return false;
     }
     return true;
 }
 
 void JNICALL onMemoryClassPrepare(jvmtiEnv* jvmti, JNIEnv* env, jthread, jclass klass) {
-    if (jvmti == nullptr || env == nullptr || !g_memoryModules) return;
+    if (jvmti == nullptr || env == nullptr || klass == nullptr) return;
+    const MemoryStateSnapshot state = memoryStateSnapshot();
+    if (!state.modules || !state.nativeClasses) return;
     char* signature = nullptr;
     if (jvmti->GetClassSignature(klass, &signature, nullptr) != JVMTI_ERROR_NONE || signature == nullptr) return;
     std::string internalName(signature);
     jvmti->Deallocate(reinterpret_cast<unsigned char*>(signature));
     if (internalName.size() < 3 || internalName.front() != 'L' || internalName.back() != ';') return;
     internalName = internalName.substr(1, internalName.size() - 2);
-    if (!g_memoryNativeClasses.contains(internalName)) return;
-    if (!registerMemoryNativesForClass(env, klass, internalName)) {
+    if (!state.nativeClasses->contains(internalName)) return;
+    if (!registerMemoryNativesForClass(env, klass, internalName, state.modules)) {
         logError("Could not register prepared memory-mode JNI class " + internalName);
     }
 }
 
 void redefineLoadedClasses(JNIEnv* env, jobject loader, const std::vector<j2d::JarEntry*>& entries) {
-    if (g_jvmti == nullptr) {
-        return;
-    }
+    jvmtiEnv* const jvmti = g_jvmti;
+    if (jvmti == nullptr) return;
 
     // Each JVMTI call reaches a VM safepoint. Small batches dramatically reduce pauses
     // for large JARs while retaining bounded JNI local-reference usage.
-    constexpr std::size_t batchSize = 32;
+    constexpr std::size_t batchSize = 1;
     std::vector<jvmtiClassDefinition> batch;
     std::vector<jclass> localReferences;
+    std::vector<std::vector<unsigned char>> mutableClassBytes;
     batch.reserve(batchSize);
     localReferences.reserve(batchSize);
+    mutableClassBytes.reserve(batchSize);
 
     auto flush = [&] {
         if (batch.empty()) return;
-        const jvmtiError result = g_jvmti->RedefineClasses(
+        const jvmtiError result = jvmti->RedefineClasses(
             static_cast<jint>(batch.size()), batch.data());
         if (result != JVMTI_ERROR_NONE) {
             char* errorName = nullptr;
-            const jvmtiError nameResult = g_jvmti->GetErrorName(result, &errorName);
-            const char* reason = nameResult == JVMTI_ERROR_NONE && errorName != nullptr
-                ? errorName : "unknown";
+            const jvmtiError nameResult = jvmti->GetErrorName(result, &errorName);
+            const char* reason = nameResult == JVMTI_ERROR_NONE && errorName != nullptr ? errorName : "unknown";
             std::cerr << "Redefine class batch failed: " << result << " Cause: " << reason << std::endl;
-            if (errorName != nullptr) g_jvmti->Deallocate(reinterpret_cast<unsigned char*>(errorName));
+            if (errorName != nullptr) jvmti->Deallocate(reinterpret_cast<unsigned char*>(errorName));
         }
         for (jclass reference : localReferences) env->DeleteLocalRef(reference);
         batch.clear();
         localReferences.clear();
-    };
+        mutableClassBytes.clear();
+        };
 
     for (j2d::JarEntry* entry : entries) {
         if (!isClassEntry(entry)
@@ -731,19 +941,24 @@ void redefineLoadedClasses(JNIEnv* env, jobject loader, const std::vector<j2d::J
         const std::string name = className(entry);
         jclass loaded = loadClassFromTargetLoader(env, loader, name);
         if (loaded == nullptr) {
-            reportAndClearException(env, nullptr, false);
             continue;
         }
+        mutableClassBytes.emplace_back(
+            reinterpret_cast<const unsigned char*>(entry->getData()),
+            reinterpret_cast<const unsigned char*>(entry->getData()) + entry->getSize());
         jvmtiClassDefinition definition{};
         definition.klass = loaded;
         definition.class_byte_count = static_cast<jint>(entry->getSize());
-        definition.class_bytes = reinterpret_cast<unsigned char*>(const_cast<char*>(entry->getData()));
+        definition.class_bytes = mutableClassBytes.back().data();
         batch.push_back(definition);
         localReferences.push_back(loaded);
         if (batch.size() == batchSize) flush();
     }
+
     flush();
 }
+
+bool enableMemoryClassPrepareEvents();
 
 void runBootstrap(JNIEnv* env) {
     std::vector<j2d::JarEntry*> entries;
@@ -772,20 +987,33 @@ void runBootstrap(JNIEnv* env) {
         return;
     }
 
-    g_memoryNativeClasses.clear();
+    auto memoryNativeClasses = std::make_shared<std::unordered_set<std::string>>();
     for (const j2d::JarEntry* entry : entries) {
-        if (isClassEntry(entry)) g_memoryNativeClasses.insert(className(entry));
+        if (isClassEntry(entry)) memoryNativeClasses->insert(className(entry));
     }
-    if (!mapMemoryModules(entries)) {
-        g_memoryNativeClasses.clear();
+    std::shared_ptr<j2d::memory::ModuleRegistry> mappedModules;
+    if (!mapMemoryModules(entries, mappedModules)) {
         return;
     }
+    publishMemoryState(mappedModules, memoryNativeClasses);
+    if (mappedModules && g_jvmti == nullptr) {
+        logError("Memory modules were mapped, but JVMTI is unavailable; direct JNI export registration may be incomplete");
+    }
+    else if (mappedModules) {
+        enableMemoryClassPrepareEvents();
+    }
 
-    // Resources must be available before any class can initialize. Clean previous output
-    // and fully extract this JAR before defining/redefining classes or invoking @DllMain.
-    const fs::path resourceDirectory = getDllDirectory() / L"resources";
-    cleanupPreviousResources(resourceDirectory);
-    writeResources(entries, resourceDirectory);
+    // Resources are isolated by process and module instance under the system
+    // temporary directory. This avoids deleting a shared DLL-adjacent directory
+    // while another process is using it. Java code can read the absolute root from
+    // jar2dll.resource.dir or JAR2DLL_RESOURCE_DIR.
+    const fs::path resourceDirectory = getRuntimeResourceDirectory();
+    if (!cleanupPreviousResources(resourceDirectory)
+        || !writeResources(entries, resourceDirectory)
+        || !publishRuntimeResourceDirectory(env, resourceDirectory)) {
+        logError("Runtime resources could not be prepared completely");
+        return;
+    }
 
     const std::vector<std::string> loaderCandidates = readClassLoaderCandidates(
         classLoadersConfig.data, classLoadersConfig.size);
@@ -794,6 +1022,10 @@ void runBootstrap(JNIEnv* env) {
         loaderCandidates.empty()
             ? getCurrentThreadContextClassLoader(env)
             : findTargetClassLoader(env, loaderCandidates));
+    if (env->ExceptionCheck()) {
+        reportAndClearException(env, "Resolving target ClassLoader");
+        rawLoader.reset();
+    }
     if (!rawLoader && loaderCandidates.empty()) {
         rawLoader.reset(getSystemClassLoader(env));
     }
@@ -820,7 +1052,6 @@ void runBootstrap(JNIEnv* env) {
         if (!isClassEntry(entry)) continue;
         LocalRef<jclass> existing(env, loadClassFromTargetLoader(env, loader.get(), className(entry)));
         if (!existing) {
-            reportAndClearException(env, nullptr, false);
             pendingDefinitions.push_back(entry);
         }
         else {
@@ -830,7 +1061,8 @@ void runBootstrap(JNIEnv* env) {
 
     // Define only classes still unresolved. A successful class leaves the queue, so a
     // large JAR no longer performs 10*N FindClass calls or repeatedly touches old classes.
-    for (int round = 0; round < 10 && !pendingDefinitions.empty(); ++round) {
+    std::unordered_map<std::string, std::string> definitionErrors;
+    for (int round = 0; round < 18 && !pendingDefinitions.empty(); ++round) {
         bool madeProgress = false;
         std::vector<j2d::JarEntry*> next;
         next.reserve(pendingDefinitions.size());
@@ -844,9 +1076,13 @@ void runBootstrap(JNIEnv* env) {
                 reinterpret_cast<const jbyte*>(entry->getData()), static_cast<jsize>(entry->getSize())));
             if (defined) {
                 madeProgress = true;
+                definitionErrors.erase(name);
             }
             else {
-                reportAndClearException(env, nullptr, false);
+                std::string reason = takePendingJavaException(env, false);
+                definitionErrors[name] = reason.empty()
+                    ? "DefineClass returned null without a Java exception"
+                    : std::move(reason);
                 next.push_back(entry);
             }
         }
@@ -855,11 +1091,22 @@ void runBootstrap(JNIEnv* env) {
     }
     if (!pendingDefinitions.empty()) {
         logError("Could not define " + std::to_string(pendingDefinitions.size()) + " class(es) after dependency retries");
+        for (const j2d::JarEntry* entry : pendingDefinitions) {
+            const std::string name = className(entry);
+            const auto error = definitionErrors.find(name);
+            logError("  " + name + ": "
+                + (error == definitionErrors.end() ? "unknown definition failure" : error->second));
+        }
     }
 
     // New classes are already current. Only redefine classes that existed before this DLL
     // was loaded, and do it after the definition phase in bounded JVMTI batches.
-    redefineLoadedClasses(env, loader.get(), loadedBeforeDefinition);
+
+    //redefineLoadedClasses(env, loader.get(), loadedBeforeDefinition);
+    if (!registerMemoryNatives(env, loader.get(), entries)) {
+        logError("Could not complete memory-mode native registration for loaded classes");
+        return;
+    }
     LocalRef<jclass> threadClass(env, env->FindClass("java/lang/Thread"));
     const bool threadClassException = reportAndClearException(env, "FindClass(java/lang/Thread)");
     if (!threadClass || threadClassException) {
@@ -905,22 +1152,16 @@ void runBootstrap(JNIEnv* env) {
     // 保留原调用逻辑：先 FindClass，失败后再通过目标 ClassLoader.loadClass 回退。
     LocalRef<jclass> mainClass(env, env->FindClass(jniPath.c_str()));
     if (env->ExceptionCheck() || !mainClass) {
-        reportAndClearException(env, nullptr, false);
-
-        LocalRef<jclass> loaderClass(env, env->GetObjectClass(loader.get()));
-        if (loaderClass) {
-            const jmethodID loadClass = env->GetMethodID(
-                loaderClass.get(), "loadClass", "(Ljava/lang/String;)Ljava/lang/Class;");
-            LocalRef<jstring> className(env, env->NewStringUTF(targetClass.c_str()));
-            if (loadClass != nullptr && className) {
-                mainClass.reset(static_cast<jclass>(
-                    env->CallObjectMethod(loader.get(), loadClass, className.get())));
-            }
-        }
-        reportAndClearException(env, "Loading configured main class");
+        reportAndClearException(env, ("FindClass(" + jniPath + ")").c_str(), false);
+        mainClass.reset(loadClassFromTargetLoader(env, loader.get(), jniPath));
     }
 
     if (mainClass) {
+        if (targetSignature != "()V" && targetSignature != "([Ljava/lang/String;)V") {
+            logError("Unsupported configured main signature: " + targetSignature
+                + "; expected ()V or ([Ljava/lang/String;)V");
+        }
+        else {
         const jmethodID method = env->GetStaticMethodID(
             mainClass.get(), targetMethod.c_str(), targetSignature.c_str());
         const bool methodException = reportAndClearException(
@@ -962,6 +1203,10 @@ void runBootstrap(JNIEnv* env) {
             }
             reportAndClearException(env, "Executing configured main method");
         }
+        }
+    }
+    else {
+        logError("Configured main class could not be loaded: " + targetClass);
     }
 
     // 释放优先级：目标方法结束/异常清除 -> 恢复原 ClassLoader -> 删除 JNI 引用
@@ -991,8 +1236,7 @@ bool acquireJvmti(JavaVM* vm) {
 
     jvmtiEventCallbacks callbacks{};
     callbacks.ClassPrepare = onMemoryClassPrepare;
-    if (environment->SetEventCallbacks(&callbacks, sizeof(callbacks)) != JVMTI_ERROR_NONE
-        || environment->SetEventNotificationMode(JVMTI_ENABLE, JVMTI_EVENT_CLASS_PREPARE, nullptr) != JVMTI_ERROR_NONE) {
+    if (environment->SetEventCallbacks(&callbacks, sizeof(callbacks)) != JVMTI_ERROR_NONE) {
         g_jvmti = nullptr;
         return false;
     }
@@ -1001,14 +1245,27 @@ bool acquireJvmti(JavaVM* vm) {
     return true;
 }
 
+bool enableMemoryClassPrepareEvents() {
+    if (g_jvmti == nullptr) return false;
+    const jvmtiError result = g_jvmti->SetEventNotificationMode(
+        JVMTI_ENABLE, JVMTI_EVENT_CLASS_PREPARE, nullptr);
+    if (result != JVMTI_ERROR_NONE) {
+        logError("Could not enable JVMTI ClassPrepare notifications: " + std::to_string(result));
+        return false;
+    }
+    return true;
+}
+
 DWORD WINAPI loaderThread(LPVOID) {
-    // 工作线程执行期间持有额外 DLL 引用，防止外部过早 FreeLibrary 后线程继续执行
-    // 已卸载的代码。最后用 FreeLibraryAndExitThread 一次完成“释放模块 + 退出线程”。
-    HMODULE workerModuleReference = nullptr;
+    // Java may retain registered native pointers indefinitely. Pinning prevents
+    // external FreeLibrary calls from unloading this code while the JVM is alive.
+    HMODULE pinnedModule = nullptr;
     if (!GetModuleHandleExW(
-            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-            reinterpret_cast<LPCWSTR>(&g_module),
-            &workerModuleReference)) {
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            reinterpret_cast<LPCWSTR>(&loaderThread),
+            &pinnedModule)) {
+        logError("Could not pin jar2dll for the process lifetime; error "
+            + std::to_string(GetLastError()));
         return 1;
     }
 
@@ -1018,18 +1275,23 @@ DWORD WINAPI loaderThread(LPVOID) {
         // 该作用域结束时，runBootstrap 中的引用已经全部释放，随后才 DetachCurrentThread。
         AttachedThreadGuard attached(g_jvm);
         if (attached) {
-            acquireJvmti(g_jvm);
+            if (!acquireJvmti(g_jvm)) {
+                logError("Could not acquire JVMTI; class redefinition and memory JNI registration are unavailable");
+            }
             runBootstrap(attached.env());
         }
         else {
+            logError("AttachCurrentThreadAsDaemon failed with JNI status "
+                + std::to_string(attached.status()));
             exitCode = 2;
         }
     }
     else {
+        logError("No created JVM was available to jar2dll");
         exitCode = 3;
     }
 
-    FreeLibraryAndExitThread(workerModuleReference, exitCode);
+    return exitCode;
 }
 
 } // namespace
@@ -1043,6 +1305,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         // C++ 容器操作都放到 loaderThread 中执行。
         HANDLE thread = CreateThread(nullptr, 0, loaderThread, nullptr, 0, nullptr);
         if (thread == nullptr) {
+            const DWORD error = GetLastError();
+            std::ostringstream message;
+            message << "[jar2dll] CreateThread failed during DLL initialization; error " << error << "\n";
+            OutputDebugStringA(message.str().c_str());
             return FALSE;
         }
 
@@ -1050,7 +1316,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
         CloseHandle(thread);
     }
 
-    // DLL_PROCESS_DETACH 中不执行 filesystem::remove_all。卸载阶段持有 loader lock，
-    // 递归文件操作可能死锁；旧 resources 会在下一次 loaderThread 启动时清理。
+    // No filesystem or JVM work is performed under the loader lock. Runtime
+    // resources live in a process/module-isolated temporary directory.
     return TRUE;
 }
